@@ -24,3 +24,4 @@ reports/
 *.out.json
 *.out.md
 *.out.html
+*.zip

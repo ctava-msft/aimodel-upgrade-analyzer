@@ -22,8 +22,15 @@
   omitted, a built-in default table is used (update it before relying on it).
 
 .PARAMETER SubscriptionId
-  One or more subscription IDs. If omitted, all subscriptions accessible to
-  the current Az context are scanned.
+  One or more subscription IDs. If omitted, subscriptions are auto-discovered
+  from -TenantId (when provided) or from the current Az context.
+
+.PARAMETER TenantId
+  Optional Microsoft Entra tenant ID. When supplied, the script ensures the
+  current Az context is connected to this tenant (running Connect-AzAccount
+  -TenantId if needed) and enumerates only the subscriptions that live in it.
+  Mutually compatible with -SubscriptionId: if both are given, -SubscriptionId
+  wins and -TenantId is only used for connection scoping.
 
 .PARAMETER RetirementDataPath
   Optional path to a JSON or CSV file describing model retirement metadata.
@@ -50,6 +57,12 @@
     -RetirementDataPath ./data/retirements.json `
     -OutputPath ./reports/modeliq.csv
 
+.EXAMPLE
+  # Discover every subscription in a single tenant and scan them all.
+  ./scripts/Find-RetiringAzureAIDeployments.ps1 `
+    -TenantId '72f988bf-86f1-41af-91ab-2d7cd011db47' `
+    -OutputPath ./reports/modeliq.csv
+
 .NOTES
   Requires: Az.Accounts, Az.Resources. Tested with Az 12.x.
 #>
@@ -57,6 +70,7 @@
 [CmdletBinding()]
 param(
     [string[]] $SubscriptionId,
+    [string]   $TenantId,
     [string]   $RetirementDataPath,
     [string]   $OutputPath = (Join-Path -Path (Get-Location) -ChildPath 'modeliq-retirements.csv'),
     [switch]   $AsJson,
@@ -81,9 +95,19 @@ function Ensure-AzModule {
 Ensure-AzModule -Name Az.Accounts
 Ensure-AzModule -Name Az.Resources
 
-if (-not (Get-AzContext)) {
+$ctx = Get-AzContext -ErrorAction SilentlyContinue
+if (-not $ctx) {
     Write-Host "No Az context found. Running Connect-AzAccount..." -ForegroundColor Yellow
-    Connect-AzAccount | Out-Null
+    if ($TenantId) {
+        Connect-AzAccount -TenantId $TenantId | Out-Null
+    } else {
+        Connect-AzAccount | Out-Null
+    }
+    $ctx = Get-AzContext
+} elseif ($TenantId -and $ctx.Tenant.Id -ne $TenantId) {
+    Write-Host "Current Az context is on tenant $($ctx.Tenant.Id); reconnecting to $TenantId..." -ForegroundColor Yellow
+    Connect-AzAccount -TenantId $TenantId | Out-Null
+    $ctx = Get-AzContext
 }
 
 #------------------------------------------------------------------------------
@@ -193,16 +217,35 @@ function Get-EnvironmentTag {
 $retirementTable = Load-RetirementTable -Path $RetirementDataPath
 
 $targetSubs = if ($SubscriptionId) {
-    $SubscriptionId | ForEach-Object { Get-AzSubscription -SubscriptionId $_ }
+    $SubscriptionId | ForEach-Object {
+        if ($TenantId) {
+            Get-AzSubscription -SubscriptionId $_ -TenantId $TenantId -ErrorAction SilentlyContinue
+        } else {
+            Get-AzSubscription -SubscriptionId $_ -ErrorAction SilentlyContinue
+        }
+    }
+} elseif ($TenantId) {
+    Write-Host "Discovering subscriptions in tenant $TenantId..." -ForegroundColor Cyan
+    $found = @(Get-AzSubscription -TenantId $TenantId -ErrorAction SilentlyContinue 3>$null |
+        Where-Object { $_.State -eq 'Enabled' })
+    Write-Host "  Found $($found.Count) enabled subscription(s) in tenant." -ForegroundColor Cyan
+    $found
 } else {
-    Get-AzSubscription
+    Get-AzSubscription -ErrorAction SilentlyContinue 3>$null |
+        Where-Object { $_.State -eq 'Enabled' }
 }
 
-if (-not $targetSubs) {
+$targetSubs = @($targetSubs | Where-Object { $_ })
+
+if (-not $targetSubs -or $targetSubs.Count -eq 0) {
+    if ($TenantId) {
+        throw "No accessible subscriptions found in tenant $TenantId."
+    }
     throw "No accessible subscriptions found."
 }
 
 $results = [System.Collections.Generic.List[object]]::new()
+$inventory = [System.Collections.Generic.List[object]]::new()
 $today = [DateTime]::UtcNow.Date
 
 foreach ($sub in $targetSubs) {
@@ -210,8 +253,9 @@ foreach ($sub in $targetSubs) {
     Set-AzContext -SubscriptionId $sub.Id | Out-Null
 
     # Get all Azure OpenAI / AIServices accounts in the subscription.
-    $accounts = Get-AzResource -ResourceType 'Microsoft.CognitiveServices/accounts' -ErrorAction SilentlyContinue |
-        Where-Object { $_.Kind -in @('OpenAI','AIServices') }
+    $accounts = @(Get-AzResource -ResourceType 'Microsoft.CognitiveServices/accounts' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Kind -in @('OpenAI','AIServices') })
+    Write-Host "  Found $($accounts.Count) OpenAI/AIServices account(s)." -ForegroundColor DarkGray
 
     foreach ($account in $accounts) {
         $apiVersion = '2024-10-01'
@@ -229,14 +273,31 @@ foreach ($sub in $targetSubs) {
             continue
         }
 
-        $deployments = ($resp.Content | ConvertFrom-Json).value
-        if (-not $deployments) { continue }
+        $deployments = @(($resp.Content | ConvertFrom-Json).value)
+        Write-Host "    $($account.Name) ($($account.Location)): $($deployments.Count) deployment(s)" -ForegroundColor DarkGray
+        if (-not $deployments -or $deployments.Count -eq 0) { continue }
 
         foreach ($dep in $deployments) {
             $model = $dep.properties.model.name
             $modelVersion = $dep.properties.model.version
             $skuName = if ($dep.sku -and $dep.sku.name) { $dep.sku.name } else { $dep.properties.sku.name }
             $capacity = if ($dep.sku -and $dep.sku.capacity) { $dep.sku.capacity } else { $dep.properties.sku.capacity }
+
+            # Always record the inventory row, regardless of retirement match.
+            $inventory.Add([pscustomobject]@{
+                subscription      = $sub.Id
+                subscription_name = $sub.Name
+                resource_group    = $account.ResourceGroupName
+                account_name      = $account.Name
+                account_kind      = $account.Kind
+                region            = $account.Location
+                deployment_name   = $dep.name
+                current_model     = $model
+                current_version   = $modelVersion
+                sku               = $skuName
+                capacity          = $capacity
+                deployment_type   = Get-DeploymentType -SkuName $skuName
+            }) | Out-Null
 
             $retire = Get-RetirementInfo -Table $retirementTable -Model $model -Version $modelVersion
 
@@ -290,14 +351,31 @@ foreach ($sub in $targetSubs) {
 # 5. Output
 #------------------------------------------------------------------------------
 
-if ($results.Count -eq 0) {
-    Write-Host "No retiring deployments found in the scanned subscriptions." -ForegroundColor Green
-    return
-}
-
 $outDir = Split-Path -Parent $OutputPath
 if ($outDir -and -not (Test-Path -LiteralPath $outDir)) {
     New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+}
+
+# Always write the full inventory (every AOAI/AIServices deployment we saw).
+if ($inventory.Count -gt 0) {
+    $invPath = Join-Path -Path $outDir -ChildPath ('aoai-inventory' + [System.IO.Path]::GetExtension($OutputPath))
+    $inventory | Sort-Object subscription_name, account_name, deployment_name |
+        Export-Csv -LiteralPath $invPath -NoTypeInformation -Encoding UTF8
+    Write-Host ""
+    Write-Host "Inventory: $($inventory.Count) deployment(s) across $($targetSubs.Count) subscription(s) -> $invPath" -ForegroundColor Green
+    $inventory |
+        Group-Object current_model |
+        Select-Object @{n='model';e={$_.Name}}, @{n='count';e={$_.Count}} |
+        Sort-Object count -Descending |
+        Format-Table -AutoSize | Out-String | Write-Host
+} else {
+    Write-Host ""
+    Write-Host "Inventory: no OpenAI / AIServices deployments found in the scanned subscription(s)." -ForegroundColor Yellow
+}
+
+if ($results.Count -eq 0) {
+    Write-Host "No retiring deployments matched the lifecycle table." -ForegroundColor Green
+    return
 }
 
 $results | Sort-Object days_to_retire, urgency, deployment_name |
